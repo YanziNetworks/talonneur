@@ -1,0 +1,3 @@
+[submodule "libexec/yu.sh"]
+	path = libexec/yu.sh
+	url = https://github.com/YanziNetworks/yu.sh.git

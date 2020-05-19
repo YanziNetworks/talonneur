@@ -1,0 +1,345 @@
+#!/usr/bin/env sh
+
+# Find yu.sh and load modules. We support several locations to ease
+# installation.
+SCRIPT_DIR=$( cd -P -- "$(dirname -- "$(command -v -- "$0")")" && pwd -P )
+### AMLG_START
+LIB_DIR=
+for _lib in ../lib lib libexec; do
+    [ -z "$LIB_DIR" ] && [ -d "$SCRIPT_DIR/$_lib" ] && LIB_DIR="$SCRIPT_DIR/$_lib"
+done
+[ -z "$LIB_DIR" ] && echo "Cannot find library directory!" >&2 && exit 1
+YUSH_DIR="$LIB_DIR/yu.sh"
+! [ -d "$YUSH_DIR" ] && echo "canno find yu.sh directory!" >&2 && exit 1
+### AMLG_END
+
+### AMLG_START ./libexec/yu.sh/log.sh ./libexec/yu.sh/file.sh ./libexec/yu.sh/text.sh ./libexec/yu.sh/multi-arch.sh
+# shellcheck source=yu.sh/log.sh disable=SC1091
+. "$YUSH_DIR/log.sh"
+# shellcheck source=yu.sh/log.sh disable=SC1091
+. "$YUSH_DIR/file.sh"
+# shellcheck source=yu.sh/log.sh disable=SC1091
+. "$YUSH_DIR/text.sh"
+# shellcheck source=yu.sh/log.sh disable=SC1091
+. "$YUSH_DIR/multi-arch.sh"
+### AMLG_END
+
+# Shell sanity
+set -eu
+
+
+# Print usage on stderr and exit
+usage() {
+    [ -n "$1" ] && echo "$1" >/dev/stderr
+    exitcode="${2:-1}"
+    cat << USAGE >&2
+
+  $YUSH_APPNAME will check for URL content changes and trigger webhooks
+
+Usage:
+
+  $(yush_basename "$0") [-option arg]...
+
+  where all dash-led single/double options are as follows.
+
+    -c | --cache
+        Path to cache directory for URL information storage between runs
+    -r | --resources | --rsc
+        Path to a directory containing .env formatted files, providing details
+        about the URL to check and the hook to trigger. See below.
+    --check(sum) | --sum
+        Sum binary to compute hash of extracted content, defaults to sha256sum.
+    --pattern
+        Globbing pattern of files to consider in directory pointed at by
+        --resources. Defaults to *.env
+    --dry(-)run
+        Do not trigger, perform all other operations and tell what hook
+        would be triggered.
+    --no-subst
+        Do not substitute variables in the values of the keys of the .env files.
+    --force
+        Force triggering, even when content hasn't changed.
+    -v | --verbose
+        Verbosity level. From error down to debug.
+    -h | --help
+        Print this help and exit
+
+Description:
+
+  The .env files should contain uppercased keys, followed by equal signs and
+  the value of the keys. Value content is substituted for the value of
+  variables, unless --no-subst is specified. Empty lines and lines starting
+  with a hashmark (#) are ignored. Most keys are optional. The recognised keys
+  are the following:
+
+    URL       URL to download from and check for changes
+    START     regex matching first line of block to consider, empty==line 0
+    END       regex matching last line of block to consider, empty==last line
+    HOOK      webhook to trigger on changes
+    REQUEST   Type of request to perform on changes: GET, POST, PUT, etc.
+    FREEFORM  Freeform command-line arguments to curl on changes
+
+Naming:
+
+  This script calls hooks. Talonneur is French for the Rugby forwards player
+  hooker. That noun has other less glorious connotations.
+
+USAGE
+  exit "$exitcode"
+}
+
+
+# Uncomment for debugging
+#set -x
+
+DATA_ROOT=${TALONNEUR_ROOT:-"$(dirname "$0")"}
+
+CACHE=${TALONNEUR_CACHE:-"${DATA_ROOT%/}/cache"}
+RESOURCES=${TALONNEUR_RESOURCES:-"${DATA_ROOT%/}/resources"}
+
+# Pattern matching the JARs to download and/or upload.
+PATTERN=${TALONNEUR_PATTERN:-"*.env"}
+
+# Show what would be done instead.
+DRYRUN=0
+
+# Force triggers
+FORCE=0
+
+SUBST=1
+
+SUM=sha256sum
+
+SLEEP=-1
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c | --cache)
+            CACHE=$2; shift 2;;
+        --cache=*)
+            CACHE="${1#*=}"; shift 1;;
+
+        -r | --resources | --rsc)
+            RESOURCES=$2; shift 2;;
+        --resources=* | --rsc=*)
+            RESOURCES="${1#*=}"; shift 1;;
+
+        --check | --sum | --checksum)
+            SUM=$2; shift 2;;
+        --check=* | --sum=* | --checksum=*)
+            SUM="${1#*=}"; shift 1;;
+
+        --pattern)
+            PATTERN=$2; shift 2;;
+        --pattern=*)
+            PATTERN="${1#*=}"; shift 1;;
+
+        --dry-run | --dryrun)
+            DRYRUN=1; shift;;
+
+        --no-subst)
+            SUBST=0; shift;;
+
+        --force)
+            FORCE=1; shift;;
+
+        -v | --verbose)
+            # shellcheck disable=SC2034
+            YUSH_LOG_LEVEL=$2; shift 2;;
+        --verbose=*)
+            # shellcheck disable=SC2034
+            YUSH_LOG_LEVEL="${1#*=}"; shift 1;;
+
+        --non-interactive | --no-colour | --no-color)
+            # shellcheck disable=SC2034
+            YUSH_LOG_COLOUR=0; shift 1;;
+
+        -h | --help)
+            usage "" 0;;
+
+        --)
+            shift; break;;
+        -*)
+            usage "Unknown option: $1 !";;
+        *)
+            break;;
+    esac
+done
+
+RESOURCES=$(yush_abspath "$RESOURCES")
+CACHE=$(yush_abspath "$CACHE")
+TMPDIR=$(yush_mktemp -d)
+KEYS="URL|START|END|HOOK|REQUEST|FREEFORM"
+
+if echo "$SLEEP"|grep -Eq '[0-9]+[[:space:]]*[A-Za-z]+'; then
+    SLEEP=$(yush_howlong "$SLEEP")
+    yush_debug "Converted looping period to $SLEEP secs."
+fi
+
+rsc_read() {
+    # Empty all known resource variables
+    for key in $(yush_split "$KEYS" "|"); do
+        export "RSC_${key}="
+    done
+
+    if [ "$#" -gt 0 ] && [ -n "$1" ] && [ -f "$1" ]; then
+        yush_info "Reading resource configuration from $1"
+        while IFS='=' read -r key val || [ -n "$key" ]; do
+            # Skip over lines containing comments.
+            # (Lines starting with '#').
+            [ "${key##\#*}" ] || continue
+
+            if [ -n "$key" ]; then
+                if printf %s\\n "$key" | grep -Eq "($KEYS)"; then
+                    yush_is_true "$SUBST" && val=$(yush_envsubst "$val")
+                    yush_debug "Setting RSC_$key=$val"
+                    export "RSC_${key}=${val}" 2>/dev/null || yush_warn "warning $key is not a valid variable name"
+                else
+                    yush_warn "$key is an unknown resource variable"
+                fi
+            fi
+        done < "$1"
+    fi
+}
+
+rsc_download() {
+    if command -v curl >/dev/null; then
+        yush_debug "Downloading $RSC_URL"
+
+        # Prepare for storing raw URL content in temp directory and download to
+        # that location.
+        _raw=$(mktemp)
+        _filtered="${TMPDIR}/${RSC__NAME}.bin"
+        curl -sSL -o - "$RSC_URL" > "${TMPDIR}/${RSC__NAME}.bin" > "$_raw"
+
+        # Filter content so we are able to extract the block of text between the
+        # first line matching $RSC_START and the first line after matching
+        # $RSC_END. Empty for each of these mean either start or end of file.
+        if [ -n "$RSC_START" ] && [ -n "$RSC_END" ]; then
+            # awk "/${RSC_START}/,/${RSC_END}/" "$_raw" > "$_filtered"
+            yush_debug "Keeping block between $RSC_START and $RSC_END"
+            sed -nE "/${RSC_START}/,/${RSC_END}/p;/${RSC_END}/q" "$_raw" > "$_filtered"
+        elif [ -z "$RSC_START" ] && [ -n "$RSC_END" ]; then
+            # awk "1,/${RSC_END}/" "$_raw" > "$_filtered"
+            yush_debug "Keeping block from start of content to $RSC_END"
+            sed -E "/${RSC_END}/q" "$_raw" > "$_filtered"
+        elif [ -n "$RSC_START" ] && [ -z "$RSC_END" ]; then
+            yush_debug "Keeping block $RSC_START to end of content"
+            awk "/${RSC_START}/,0" "$_raw" > "$_filtered"
+        else
+           yush_debug "Keeping entire content"
+            # Save one copy by moving directly.
+            mv "$_raw" "$_filtered"
+        fi
+
+        # Remove the raw non filtered file
+        if [ -f "$_raw" ]; then
+            rm -f "$_raw"
+        fi
+        # If we managed to generate something, echo to caller.
+        if [ -f "$_filtered" ]; then
+            echo "$_filtered"
+        fi
+    fi
+}
+
+rsc_trigger() {
+    if [ -n "$RSC_HOOK" ] || [ -n "$RSC_FREEFORM" ]; then
+        if [ "$DRYRUN" = "1" ]; then
+            if [ -n "$RSC_HOOK" ]; then
+                yush_info "Would trigger: $RSC_HOOK"
+            else
+                yush_info "Would call curl with: $RSC_FREEFORM"
+            fi
+        else
+            if [ -n "$RSC_HOOK" ]; then
+                [ -z "$RSC_REQUEST" ] && RSC_REQUEST="GET"
+                if command -v curl >/dev/null; then
+                    yush_notice "Performing $RSC_REQUEST on $RSC_HOOK"
+                    curl -sSL -o /dev/null -X "$RSC_REQUEST" "$RSC_HOOK"
+                fi
+            else
+                yush_notice "Performing free-form curl command: curl $RSC_FREEFORM"
+                curl $RSC_FREEFORM
+            fi
+        fi
+    fi
+}
+
+
+rsc_check() {
+    # Set internal double-underscored variables and read configuration.
+    RSC__BASENAME=$(yush_basename "$1")
+    RSC__NAME=${RSC__BASENAME%$PATTERN}
+    rsc_read "$1"
+    if [ -n "$RSC_URL" ]; then
+        ext=$(basename "$SUM" | sed 's/sum//g')
+
+        # Get current content and generate checksum for it.
+        content=$(rsc_download)
+        yush_debug "Generating $ext sum"
+        sum=$("$SUM" "$content" | awk '{print $1}')
+
+        # Get previous sum
+        RSC__SUMPATH="${CACHE%/}/${RSC__NAME}.${ext}"
+        old=
+        [ -f "$RSC__SUMPATH" ] && old=$(cat "$RSC__SUMPATH")
+
+        # Trigger on sum change
+        if [ "$FORCE" = "1" ] || [ "$old" != "$sum" ]; then
+            rsc_trigger
+        else
+            yush_debug "No change for $1"
+        fi
+
+        # Store sum for next run
+        if ! [ -d "$CACHE" ]; then
+            yush_notice "Creating run cache directory $CACHE"
+            mkdir -p "$CACHE"
+        fi
+        printf %s\\n "$sum" > "$RSC__SUMPATH"
+    else
+        yush_warn "Resource at $1 has no URL setup!"
+    fi
+
+    # Empty variables that might have been set.
+    for key in $(yush_split "$KEYS" "|"); do
+        unset "RSC_${key}" || true
+    done
+}
+
+all_check() {
+    find "$RESOURCES" -mindepth 1 -maxdepth 1 -name "$PATTERN" -print |
+    while IFS= read -r cfg; do
+        rsc_check "$cfg"
+    done
+}
+
+# Our general exit handler
+quit() {
+    err=$?
+    trap '' EXIT INT TERM
+    yush_debug "Cleaning up temporary storage at $TMPDIR"
+    rm -rf "$TMPDIR"
+    exit $err
+}
+sig_cleanup() {
+    trap '' EXIT # some shells will call EXIT after the INT handler
+    false # sets $?
+    quit
+}
+trap quit EXIT
+trap sig_cleanup INT QUIT TERM
+
+
+if [ -z "$SLEEP" ] || [ "$SLEEP" -lt "0" ]; then
+    yush_info "Checking all hooks matching $PATTERN at $RESOURCES."
+    all_check
+else
+    yush_info "Checking all hooks matching $PATTERN at $RESOURCES every $SLEEP secs."
+    while true; do
+        all_check
+        sleep "$SLEEP"
+    done
+fi
+
