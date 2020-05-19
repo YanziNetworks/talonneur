@@ -92,12 +92,15 @@ USAGE
 # Uncomment for debugging
 #set -x
 
+# Root directory where to find default cache and resource directories.
 DATA_ROOT=${TALONNEUR_ROOT:-"$(dirname "$0")"}
 
+# Run-cache and resources directories. The resources is where .env files will be
+# found, which will instruct talonneur what to do.
 CACHE=${TALONNEUR_CACHE:-"${DATA_ROOT%/}/cache"}
 RESOURCES=${TALONNEUR_RESOURCES:-"${DATA_ROOT%/}/resources"}
 
-# Pattern matching the JARs to download and/or upload.
+# Pattern matching the env files to consider
 PATTERN=${TALONNEUR_PATTERN:-"*.env"}
 
 # Show what would be done instead.
@@ -106,10 +109,15 @@ DRYRUN=0
 # Force triggers
 FORCE=0
 
+# Should we substitute the content of variables in the .env files
 SUBST=1
 
+# Program to compute hash sums. sum will automatically be removed from the end
+# to form the extension of the files with the information in the cache.
 SUM=sha256sum
 
+# How long to sleep between tests. Negative for once only (the default). The
+# implementation understans human-friendly periods such as 1h or 3 minutes.
 SLEEP=-1
 
 while [ $# -gt 0 ]; do
@@ -166,11 +174,18 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Resolve directories to absolute paths
 RESOURCES=$(yush_abspath "$RESOURCES")
 CACHE=$(yush_abspath "$CACHE")
+
+# Create a temporary directory where to store content of remote URLs
 TMPDIR=$(yush_mktemp -d)
+
+# These are the only keys that we will support in the .env file. Anything else
+# is skipped. The list needs to be formatted using | as it will be given to grep
 KEYS="URL|START|END|HOOK|REQUEST|FREEFORM"
 
+# Convert the sleep period to seconds when it is human-like
 if echo "$SLEEP"|grep -Eq '[0-9]+[[:space:]]*[A-Za-z]+'; then
     SLEEP=$(yush_howlong "$SLEEP")
     yush_debug "Converted looping period to $SLEEP secs."
