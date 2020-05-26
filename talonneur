@@ -43,7 +43,8 @@ Usage:
   where all dash-led single/double options are as follows.
 
     -c | --cache
-        Path to cache directory for URL information storage between runs
+        Path to cache file for storage between runs, defaults to .talonneur.sum
+        in same directory as resources
     -r | --resources | --rsc
         Path to a directory containing .env formatted files, providing details
         about the URL to check and the hook to trigger. See below.
@@ -97,8 +98,8 @@ DATA_ROOT=${TALONNEUR_ROOT:-"$(dirname "$0")"}
 
 # Run-cache and resources directories. The resources is where .env files will be
 # found, which will instruct talonneur what to do.
-CACHE=${TALONNEUR_CACHE:-"${DATA_ROOT%/}/cache"}
 RESOURCES=${TALONNEUR_RESOURCES:-"${DATA_ROOT%/}/resources"}
+CACHE=${TALONNEUR_CACHE:-}
 
 # Pattern matching the env files to consider
 PATTERN=${TALONNEUR_PATTERN:-"*.env"}
@@ -173,6 +174,13 @@ while [ $# -gt 0 ]; do
             break;;
     esac
 done
+
+# Defaults to .talonneur.sum in same directory as resources for sum storage
+# between runs.
+if [ -z "$CACHE" ]; then
+    CACHE=${RESOURCES%/}/.talonneur.sum
+    yush_debug "Defaulting to using $CACHE for cache storage between runs"
+fi
 
 # Resolve directories to absolute paths
 RESOURCES=$(yush_abspath "$RESOURCES")
@@ -296,9 +304,8 @@ rsc_check() {
         sum=$("$SUM" "$content" | awk '{print $1}')
 
         # Get previous sum
-        RSC__SUMPATH="${CACHE%/}/${RSC__NAME}.${ext}"
         old=
-        [ -f "$RSC__SUMPATH" ] && old=$(cat "$RSC__SUMPATH")
+        [ -f "$CACHE" ] && old=$(grep -E "^[a-f0-9]+  ${RSC__BASENAME}" $CACHE | awk '{print $1}')
 
         # Trigger on sum change
         if [ "$FORCE" = "1" ] || [ "$old" != "$sum" ]; then
@@ -307,12 +314,15 @@ rsc_check() {
             yush_debug "No change for $1"
         fi
 
-        # Store sum for next run
-        if ! [ -d "$CACHE" ]; then
-            yush_notice "Creating run cache directory $CACHE"
-            mkdir -p "$CACHE"
+        # Store sum for next run. This is stored in the same format as the
+        # sha256sum and friends, i.e. the sum, two spaces, the file. But in our
+        # case, the file is only an identifier as what we make the sum on is the
+        # content from the remote URL.
+        if ! [ -f "$CACHE" ] || [ -z "$old" ]; then
+            printf "%s  %s\n" "$sum" "$RSC__BASENAME" >> $CACHE
+        else
+            sed -Ei "s/$old  ${RSC__BASENAME}/$sum  ${RSC__BASENAME}/" "$CACHE"
         fi
-        printf %s\\n "$sum" > "$RSC__SUMPATH"
     else
         yush_warn "Resource at $1 has no URL setup!"
     fi
