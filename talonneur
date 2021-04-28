@@ -191,7 +191,7 @@ TMPDIR=$(yush_mktemp -d)
 
 # These are the only keys that we will support in the .env file. Anything else
 # is skipped. The list needs to be formatted using | as it will be given to grep
-KEYS="URL|START|END|HOOK|REQUEST|FREEFORM"
+KEYS="URL|START|END|FILTER|TRANSFORM|HOOK|REQUEST|FREEFORM"
 
 # Convert the sleep period to seconds when it is human-like
 if echo "$SLEEP"|grep -Eq '[0-9]+[[:space:]]*[A-Za-z]+'; then
@@ -233,7 +233,29 @@ rsc_download() {
         # that location.
         _raw=$(mktemp)
         _filtered="${TMPDIR}/${RSC__NAME}.bin"
-        curl -sSL -o - "$RSC_URL" > "${TMPDIR}/${RSC__NAME}.bin" > "$_raw"
+        curl -sSL -o - "$RSC_URL" > "$_raw"
+
+        # First filtering/transformation passes
+        if [ -n "$RSC_FILTER" ]; then
+            yush_debug "Filtering content with $RSC_FILTER"
+            if grep -oE -e "$RSC_FILTER" "$_raw" > "$_filtered"; then
+                # Make the filtered content the raw data to keep working on.
+                cp "$_filtered" "$_raw"
+            else
+                yush_error "Could not exec following on content: grep -oE -e $RSC_FILTER"
+            fi
+        fi
+
+        if [ -n "$RSC_TRANSFORM" ]; then
+            yush_debug "Transforming content with $RSC_TRANSFORM"
+            if sed -E -e "$RSC_TRANSFORM" "$_raw" > "$_filtered"; then
+                # Make the transformed content the raw data to keep working on.
+                cp "$_filtered" "$_raw"
+            else
+                yush_error "Could not exec following on content: sed -E -e $RSC_TRANSFORM"
+            fi
+        fi
+
 
         # Filter content so we are able to extract the block of text between the
         # first line matching $RSC_START and the first line after matching
@@ -244,13 +266,13 @@ rsc_download() {
             sed -nE "/${RSC_START}/,/${RSC_END}/p;/${RSC_END}/q" "$_raw" > "$_filtered"
         elif [ -z "$RSC_START" ] && [ -n "$RSC_END" ]; then
             # awk "1,/${RSC_END}/" "$_raw" > "$_filtered"
-            yush_debug "Keeping block from start of content to $RSC_END"
+            yush_debug "Keeping block from start to $RSC_END"
             sed -E "/${RSC_END}/q" "$_raw" > "$_filtered"
         elif [ -n "$RSC_START" ] && [ -z "$RSC_END" ]; then
-            yush_debug "Keeping block $RSC_START to end of content"
+            yush_debug "Keeping block $RSC_START to end"
             awk "/${RSC_START}/,0" "$_raw" > "$_filtered"
         else
-           yush_debug "Keeping entire content"
+            yush_debug "No line selection performed"
             # Save one copy by moving directly.
             mv "$_raw" "$_filtered"
         fi
@@ -261,7 +283,7 @@ rsc_download() {
         fi
         # If we managed to generate something, echo to caller.
         if [ -f "$_filtered" ]; then
-            echo "$_filtered"
+            printf %s\\n "$_filtered"
         fi
     fi
 }
@@ -300,12 +322,13 @@ rsc_check() {
 
         # Get current content and generate checksum for it.
         content=$(rsc_download)
+        yush_trace "$(cat "$content")";  # Trace content for decision debugging
         yush_debug "Generating $ext sum"
         sum=$("$SUM" "$content" | awk '{print $1}')
 
         # Get previous sum
         old=
-        [ -f "$CACHE" ] && old=$(grep -E "^[a-f0-9]+  ${RSC__BASENAME}" $CACHE | awk '{print $1}')
+        [ -f "$CACHE" ] && old=$(grep -E -e "^[a-f0-9]+  ${RSC__BASENAME}" "$CACHE" | awk '{print $1}')
 
         # Trigger on sum change
         if [ "$FORCE" = "1" ] || [ "$old" != "$sum" ]; then
@@ -367,4 +390,3 @@ else
         sleep "$SLEEP"
     done
 fi
-
